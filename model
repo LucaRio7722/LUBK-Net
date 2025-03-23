@@ -1,0 +1,264 @@
+#The code of LUBK-Net by Rui Liu
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from models.dgcnn import DGCNN
+from models.attention import SelfAttention
+from models.dgcnn_new import DGCNN_semseg
+
+
+class BaseLearner(nn.Module):
+
+    def __init__(self, in_channels, params):
+        super(BaseLearner, self).__init__()
+
+        self.num_convs = len(params)
+        self.convs = nn.ModuleList()
+
+        for i in range(self.num_convs):
+            if i == 0:
+                in_dim = in_channels
+            else:
+                in_dim = params[i - 1]
+            self.convs.append(nn.Sequential(
+                nn.Conv1d(in_dim, params[i], kernel_size=1, padding=0),
+                nn.BatchNorm1d(params[i]),
+                nn.ReLU(inplace=True)
+            ))
+
+    def forward(self, x):
+        for conv in self.convs:
+            x = conv(x)
+        return x
+
+
+class F3x3_Module(nn.Module):
+    def __init__(self, feat_dim, classes, bgpro_num=2):
+        super(F3x3_Module, self).__init__()
+        self.down_bg = nn.Sequential(
+            nn.Conv1d(feat_dim * (bgpro_num + 1), feat_dim, kernel_size=1, stride=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5)
+        )
+        self.bg_res1 = nn.Sequential(
+            nn.Conv1d(feat_dim, feat_dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(feat_dim, feat_dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.ReLU(inplace=True),
+        )
+        self.bg_cls = nn.Sequential(
+            nn.Conv1d(feat_dim, feat_dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),
+            nn.Conv1d(feat_dim, classes, kernel_size=1, stride=1)
+        )
+
+    def forward(self, x):
+        x_down = self.down_bg(x)
+        x_res = self.bg_res1(x_down)
+        x_out = x_down + x_res
+        y = self.bg_cls(x_out)
+        return y
+
+
+class LUBK(nn.Module):
+    def __init__(self, args):
+        super(LUBK, self).__init__()
+        self.n_way = args.n_way
+        self.k_shot = args.k_shot
+        self.in_channels = args.pc_in_dim
+        self.n_points = args.pc_npts
+        self.use_attention = args.use_attention
+        self.n_subprototypes = args.n_subprototypes
+        self.k_connect = args.k_connect
+        self.sigma = args.sigma
+
+        self.n_classes = self.n_way + 1
+        self.base_learner = BaseLearner(args.dgcnn_mlp_widths[-1], args.base_widths)
+        self.att_learner = SelfAttention(args.dgcnn_mlp_widths[-1], args.output_dim)
+        self.encoder = DGCNN_semseg(
+            args.edgeconv_widths,
+            args.dgcnn_mlp_widths,
+            args.pc_in_dim,
+            k=args.dgcnn_k,
+            return_edgeconvs=True
+        ) if args.use_high_dgcnn else DGCNN(
+            args.edgeconv_widths,
+            args.dgcnn_mlp_widths,
+            args.pc_in_dim,
+            k=args.dgcnn_k,
+            return_edgeconvs=True
+        )
+
+        self.feat_dim = 320
+        self.bgpro_num = 2
+        self.P_BG = nn.Parameter(torch.zeros(1, self.feat_dim * self.bgpro_num, 1))
+
+        self.F3x3 = F3x3_Module(
+            feat_dim=self.feat_dim,
+            classes=self.n_classes,
+            bgpro_num=self.bgpro_num
+        )
+
+        self.final_conv = nn.Sequential(
+            nn.Conv1d(self.feat_dim, self.feat_dim, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),
+            nn.Conv1d(self.feat_dim, self.n_classes, kernel_size=1, stride=1),
+        )
+
+        self.conv_1 = nn.Sequential(
+            nn.Conv1d(self.feat_dim, self.feat_dim, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm1d(self.feat_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.5)
+        )
+
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-1)
+        self.bg_loss = nn.BCEWithLogitsLoss()
+        self.gamma = 0.05
+        self.beta = 0.5
+
+    def forward(self, support_x, support_y, query_x, query_y):
+        support_y = support_y.detach()
+        query_y = query_y.detach()
+
+        support_x = support_x.view(self.n_way * self.k_shot, self.in_channels, self.n_points)
+        support_feat = self.getFeatures(support_x)
+        support_feat = support_feat.view(self.n_way, self.k_shot, self.feat_dim, self.n_points)
+        query_feat = self.getFeatures(query_x)
+
+        fg_mask = support_y
+        bg_mask = torch.logical_not(support_y)
+
+        support_fg_feat = self.getMaskedFeatures(support_feat, fg_mask)
+        support_bg_feat = self.getMaskedFeatures(support_feat, bg_mask)
+
+        fg_prototypes, bg_prototype = self.getPrototype(support_fg_feat, support_bg_feat)
+        prototypes = torch.stack([bg_prototype] + fg_prototypes, dim=0)
+
+        B, K, D, N = support_feat.size()
+        P_BG_expanded_support = self.P_BG.expand(B * K, -1, N)
+        support_feat_reshaped = support_feat.view(-1, self.feat_dim, N)
+        support_feat_with_PBG = torch.cat((support_feat_reshaped, P_BG_expanded_support), dim=1)
+
+        P_BG_expanded_query = self.P_BG.expand(query_feat.size(0), -1, query_feat.size(2))
+        query_feat_with_PBG = torch.cat((query_feat, P_BG_expanded_query), dim=1)
+
+        yq_BG = self.F3x3(query_feat_with_PBG)
+        ys_BG = self.F3x3(support_feat_with_PBG)
+
+        erfa = self.compute_adaptive_erfa(query_y, support_y)
+        L_BG = self.computeBackgroundMiningLoss(yq_BG, ys_BG, query_y, support_y, erfa)
+
+        query_feat_flat = query_feat.transpose(1, 2).contiguous().view(-1, self.feat_dim)
+        contrastive_loss = self.computeContrastiveLoss(prototypes, query_feat_flat, query_y.view(-1))
+
+        similarity = [self.calculateSimilarity_trans(query_feat, prototype) for prototype in prototypes]
+        query_pred = torch.stack(similarity, dim=1)
+        main_loss1 = self.computeCrossEntropyLoss(query_pred, query_y)
+
+        loss = main_loss1 + self.gamma * contrastive_loss + self.beta * L_BG
+        return query_pred, loss
+
+    def getFeatures(self, x):
+        feat_level1, feat_level2, _ = self.encoder(x)
+        feat_level3 = self.base_learner(feat_level2)
+        att_feat = self.att_learner(feat_level2)
+        out_feat = torch.cat([
+            feat_level1[0],
+            feat_level1[1],
+            feat_level1[2],
+            att_feat,
+            feat_level3
+        ], dim=1)
+        out_feat = self.conv_1(out_feat)
+        return out_feat
+
+    def getMaskedFeatures(self, feat, mask):
+        mask = mask.unsqueeze(2)
+        masked_feat = feat * mask
+        prototype = torch.sum(masked_feat, dim=3) / (mask.sum(dim=3) + 1e-5)
+        return prototype
+
+    def getPrototype(self, fg_feat, bg_feat):
+        fg_prototypes = []
+        for way in range(self.n_way):
+            weights = torch.softmax(fg_feat[way, ...], dim=0)
+            prototype = torch.sum(weights * fg_feat[way, ...], dim=0) / torch.sum(weights)
+            fg_prototypes.append(prototype)
+
+        bg_weights = torch.softmax(bg_feat.view(-1, self.feat_dim), dim=0)
+        bg_prototype = torch.sum(bg_weights * bg_feat.view(-1, self.feat_dim), dim=0) / torch.sum(bg_weights)
+        return fg_prototypes, bg_prototype
+
+    def calculateSimilarity_trans(self, feat, prototype, method='cosine', scaler=10):
+        if method == 'cosine':
+            prototype = prototype.unsqueeze(1).unsqueeze(2)
+            similarity = F.cosine_similarity(feat, prototype, dim=1) * scaler
+        elif method == 'euclidean':
+            similarity = -F.pairwise_distance(feat, prototype.unsqueeze(1).unsqueeze(2), p=2) ** 2
+        else:
+            raise ValueError("Unsupported similarity method")
+        return similarity
+
+    def computeCrossEntropyLoss(self, query_logits, query_labels):
+        return F.cross_entropy(query_logits, query_labels)
+
+    def computeContrastiveLoss(self, prototypes, query_feat, query_labels):
+        labels = (query_labels > 0).float()
+        fg_prototypes = prototypes[1:]
+        fg_prototype_mean = fg_prototypes.mean(dim=0)
+        temperature = 0.1
+
+        pos_similarity = F.cosine_similarity(
+            query_feat,
+            fg_prototype_mean.unsqueeze(0).expand_as(query_feat),
+            dim=1
+        ) / temperature
+
+        bg_prototype = prototypes[0]
+        neg_similarity = F.cosine_similarity(
+            query_feat,
+            bg_prototype.unsqueeze(0).expand_as(query_feat),
+            dim=1
+        ) / temperature
+
+        margin = 0.5
+        loss_terms = labels * F.relu(margin - pos_similarity + neg_similarity) + \
+                     (1 - labels) * F.relu(margin - neg_similarity + pos_similarity)
+        return torch.mean(loss_terms)
+
+    def computeBackgroundMiningLoss(self, yq_BG, ys_BG, query_y, support_y,erfa):
+        device = yq_BG.device
+        query_y = query_y.detach()
+        support_y = support_y.detach().view(-1, support_y.size(-1)).to(device)
+
+        loss_query = self.weighted_BCE(yq_BG, torch.zeros_like(query_y), query_y)
+        loss_query += erfa * self.criterion(yq_BG, torch.ones_like(query_y))
+
+        loss_support = self.weighted_BCE(ys_BG, torch.zeros_like(support_y), support_y)
+        loss_support += erfa * self.criterion(ys_BG, torch.ones_like(support_y))
+
+        return (loss_query + loss_support) / 2
+
+    def weighted_BCE(self, input, target, mask, weight_factor=1.0):
+        device = input.device
+        mask = mask.to(device).unsqueeze(1).float()
+        loss = self.bg_loss(input, target)
+
+        fg_ratio = torch.sum(target == 1) / (target.numel() + 1e-8)
+        bg_ratio = 1 - fg_ratio
+        erfa = bg_ratio / (fg_ratio + 1e-8)
+
+        weighted_loss = loss * mask.squeeze(1)
+        weighted_loss += erfa * loss * (1 - mask.squeeze(1))
+
+        return weighted_loss.sum() / (mask.sum() + 1e-8)
+
+    def compute_adaptive_erfa(self, query_y, support_y):
+        fg_ratio_query = torch.sum(query_y == 1) / query_y.numel()
+        fg_ratio_support = torch.sum(support_y == 1) / support_y.numel()
+        fg_ratio = (fg_ratio_query + fg_ratio_support) / 2
+        erfa=(1 - fg_ratio) / (fg_ratio + 1e-6)
+        return erfa

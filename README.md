@@ -3,4 +3,3 @@ LUBK-Net: Learning Discriminative Universal Background Knowledge for Optimizing 
 
 This project only showcases a partial implementation of the core code.
 
-Our paper is currently undergoing peer review. The code will be released once the paper is accepted.
